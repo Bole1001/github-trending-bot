@@ -3,6 +3,7 @@ import traceback
 from src.crawler import get_trending_repos, get_readme
 from src.llm_service import analyze_repo
 from src.notifier import send_telegram_message
+from src.storage import fetch_pushed_history, update_pushed_history
 
 # ==========================================
 # 优先级 高：全局调度配置
@@ -34,19 +35,41 @@ def format_markdown_message(repo_data: dict, ai_analysis: dict) -> str:
 def execute_pipeline():
     """
     执行核心流水线。
-    职责：仅处理业务流转，遇到致命错误主动抛出异常 (raise)。
     """
-    repos = get_trending_repos(limit=TARGET_REPO_COUNT)
-    if not repos:
-        # 业务逻辑阻断：主动抛出异常以触发外层告警
+    # ==========================================
+    # 逻辑重构：大池捞取与顺位递补
+    # ==========================================
+    # 1. 扩大抓取基数：一次性抓取榜单前 20 名作为候选池
+    FETCH_POOL_SIZE = 20
+    repos_pool = get_trending_repos(limit=FETCH_POOL_SIZE)
+
+    if not repos_pool:
         raise RuntimeError(
-            "爬虫模块返回空数据，GitHub Trending 页面结构可能已变更或遭遇反爬拦截。"
+            "爬虫模块返回空数据,GitHub Trending 页面结构可能已变更或遭遇反爬拦截。"
         )
 
+    # 2. 读取云端记忆
+    history = fetch_pushed_history()
+
+    # 3. 核心漏斗过滤：跳过重复项，按顺位挑选全新项目
+    filtered_repos = []
+    for repo in repos_pool:
+        if repo["repo_name"] not in history:
+            filtered_repos.append(repo)
+            # 一旦收集到了目标数量（例如 3 个），立刻停止挑选
+            if len(filtered_repos) == TARGET_REPO_COUNT:
+                break
+
+    # 4. 极端情况防御：如果前 20 个全推过了（极小概率）
+    if not filtered_repos:
+        print(f"今日 Trending 榜单前 {FETCH_POOL_SIZE} 名均已推送过，流水线静默终止。")
+        return
+
+    newly_pushed = []
     final_messages = ["📊 *今日 GitHub Trending 核心摘要* 📊\n\n"]
 
-    for index, repo in enumerate(repos):
-        print(f"\n[{index+1}/{len(repos)}] 正在处理: {repo['repo_name']}")
+    for index, repo in enumerate(filtered_repos):
+        print(f"\n[{index+1}/{len(filtered_repos)}] 正在处理: {repo['repo_name']}")
 
         readme_text = get_readme(repo["repo_name"])
 
@@ -61,7 +84,9 @@ def execute_pipeline():
         repo_msg = format_markdown_message(repo, ai_result)
         final_messages.append(repo_msg)
 
-        if index < len(repos) - 1:
+        newly_pushed.append(repo["repo_name"])
+
+        if index < len(filtered_repos) - 1:
             print(f"进入强制休眠 {SLEEP_INTERVAL} 秒...")
             time.sleep(SLEEP_INTERVAL)
 
@@ -72,6 +97,9 @@ def execute_pipeline():
 
     if not success:
         raise RuntimeError("Telegram 推送接口调用失败，请检查网络或配置。")
+
+    print("准备更新云端记忆库...")
+    update_pushed_history(newly_pushed)
 
 
 def main():
